@@ -1,0 +1,13 @@
+{
+  "source": {
+    "profile": "default",
+    "region": "us-west-2",
+    "vpc_id": "vpc-03ee9c7eb53a70f6c"
+  },
+
+  "target": {
+    "profile": "dr-cadbo",
+    "region": "us-east-1",
+    "vpc_id": "vpc-07960651bc9c19fa5"
+  }
+}
