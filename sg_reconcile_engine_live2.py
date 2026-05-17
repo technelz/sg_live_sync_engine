@@ -1651,11 +1651,86 @@ def terraform_plan_to_dict(tf_plan: TerraformLikePlan) -> Dict[str, Any]:
     }
 
 
+def run_post_apply_validation(
+    args: Args,
+    source_groups: List[Dict[str, Any]],
+    target_ec2: Any,
+) -> Dict[str, Any]:
+
+    log("\n================ POST-APPLY VALIDATION START ================")
+
+    refreshed_target_groups = fetch_security_groups(
+        target_ec2,
+        args.target_vpc_id,
+    )
+
+    validation_plan = build_plan(
+        source_groups=source_groups,
+        target_groups=refreshed_target_groups,
+        allow_legacy=args.allow_legacy,
+        tolerate_extra_rules=not args.revoke_extra_rules,
+    )
+
+    validation_graph = build_dependency_graph(
+        validation_plan,
+        source_groups,
+        refreshed_target_groups,
+    )
+
+    validation_tf_plan = build_terraform_like_plan(
+        validation_plan,
+        validation_graph,
+        source_groups,
+        refreshed_target_groups,
+    )
+
+    passed = (
+        validation_plan.missing_count == 0
+        and validation_plan.drift_count == 0
+        and validation_plan.unresolved_dependency_count == 0
+        and len(validation_tf_plan.create) == 0
+        and len(validation_tf_plan.update) == 0
+    )
+
+    status = "PASSED" if passed else "FAILED"
+
+    log(
+        f"[POST-APPLY-VALIDATION] status={status}, "
+        f"missing={validation_plan.missing_count}, "
+        f"drifted={validation_plan.drift_count}, "
+        f"unresolved_dependencies={validation_plan.unresolved_dependency_count}, "
+        f"create={len(validation_tf_plan.create)}, "
+        f"update={len(validation_tf_plan.update)}"
+    )
+
+    log("================ POST-APPLY VALIDATION COMPLETE ================\n")
+
+    return {
+        "enabled": True,
+        "status": status,
+        "passed": passed,
+        "summary": {
+            "missing": validation_plan.missing_count,
+            "drifted": validation_plan.drift_count,
+            "unresolved_dependencies": validation_plan.unresolved_dependency_count,
+            "in_sync": validation_plan.in_sync_count,
+            "create": len(validation_tf_plan.create),
+            "update": len(validation_tf_plan.update),
+            "delete": len(validation_tf_plan.delete),
+            "skip": len(validation_tf_plan.skip),
+            "cycles": len(validation_tf_plan.cycles),
+        },
+        "sg_plan": plan_to_dict(validation_plan),
+        "terraform_like_plan": terraform_plan_to_dict(validation_tf_plan),
+    }
+
+
 def build_report_payload(
     args: Args,
     sg_plan: SgPlan,
     tf_plan: TerraformLikePlan,
     context: Optional[ExecutionContext],
+    post_apply_validation: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
 
     return {
@@ -1684,6 +1759,12 @@ def build_report_payload(
             "failed_nodes": sorted(list(context.failed_nodes)) if context else [],
             "sg_id_map": context.sg_id_map if context else {},
             "rollback_actions_count": len(context.rollback_actions) if context else 0,
+        },
+        "post_apply_validation": post_apply_validation or {
+            "enabled": False,
+            "status": "NOT_RUN",
+            "passed": None,
+            "reason": "Post-apply validation only runs after --yes apply mode.",
         },
     }
 
@@ -2018,7 +2099,11 @@ def main() -> int:
             tolerate_extra_rules=not args.revoke_extra_rules,
         )
 
-        graph = build_dependency_graph(sg_plan, source_groups, target_groups)
+        graph = build_dependency_graph(
+            sg_plan,
+            source_groups,
+            target_groups,
+        )
 
         tf_plan = build_terraform_like_plan(
             sg_plan,
@@ -2030,6 +2115,7 @@ def main() -> int:
         validate_execution_safety(args, sg_plan)
 
         context: Optional[ExecutionContext] = None
+        post_apply_validation: Optional[Dict[str, Any]] = None
 
         if args.report_only:
 
@@ -2051,11 +2137,19 @@ def main() -> int:
                 args,
             )
 
+            if args.yes:
+                post_apply_validation = run_post_apply_validation(
+                    args=args,
+                    source_groups=source_groups,
+                    target_ec2=target_ec2,
+                )
+
         report_payload = build_report_payload(
             args,
             sg_plan,
             tf_plan,
             context,
+            post_apply_validation=post_apply_validation,
         )
 
         report_path = resolve_report_path(args)
